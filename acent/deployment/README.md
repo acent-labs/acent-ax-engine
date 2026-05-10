@@ -7,7 +7,7 @@ ACENT-specific deployment artifacts. **Supplements upstream's
 
 - `Dockerfile.acent` — extends the upstream Dockerfile with ACENT skill
   packs and the Phase 1 ACP bridge (when AXE-20 lands)
-- `fly.toml` — Fly.io app config for `acent-ax-hermes` (Narita region)
+- `fly.toml` — Fly.io app config for `acent-ax-engine` (Narita region)
 
 ## Why a separate Dockerfile
 
@@ -31,6 +31,6 @@ FROM ${UPSTREAM_BASE}
 
 ## Fly.io
 
-Single app slot reserved: `acent-ax-hermes` (Narita). Reuses what was
+Single app slot reserved: `acent-ax-engine` (Narita). Reuses what was
 previously the `acent-ax-paperclip` slot (paperclip Fly app destroyed
 during Phase 2 cutover).

@@ -21,7 +21,7 @@ acent/                                  # Top-level ACENT namespace
 └── deployment/                         # ACENT-specific deploy artifacts
     ├── README.md
     ├── Dockerfile.acent                # supplements upstream Dockerfile
-    └── fly.toml                        # acent-ax-hermes Fly.io app config
+    └── fly.toml                        # acent-ax-engine Fly.io app config
 ```
 
 Anything **not** under `skills/acent/` or `acent/` belongs to upstream. Edits

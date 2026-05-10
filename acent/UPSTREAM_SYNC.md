@@ -7,7 +7,7 @@ so that `git merge upstream/main` is conflict-free under normal upstream activit
 ## Remotes (set automatically by `gh repo clone`)
 
 ```
-origin    https://github.com/acent-labs/acent-ax-hermes.git
+origin    https://github.com/acent-labs/acent-ax-engine.git
 upstream  https://github.com/NousResearch/hermes-agent.git
 ```
 
