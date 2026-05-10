@@ -272,3 +272,73 @@ async def test_send_prompt_requires_initialized_session(settings: BridgeSettings
             await transport.send_prompt("hello")
     finally:
         await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_session_updates_exits_after_prompt_response_with_alive_process(
+    settings: BridgeSettings,
+) -> None:
+    """Regression for AXE-20 Codex review (2026-05-10T14:04Z).
+
+    When the ``session/prompt`` JSON-RPC response arrives but the Hermes
+    subprocess remains alive (the production ACP server stays up across
+    turns), ``session_updates()`` must drain queued updates and exit cleanly.
+    Previously it polled forever waiting for ``returncode != None``, causing
+    AnalysisSession to fall through to ``HERMES_TIMEOUT``.
+    """
+    transport = SubprocessHermesTransport(settings)
+    stdin, stdout = _wire(transport)
+    transport._session_id = "sess-1"  # bypass handshake
+    try:
+        # Server emits an update notification, then the prompt response.
+        update_payload = {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "1",
+            "title": "ax-analyzer task",
+        }
+        stdout.feed_data(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sessionId": "sess-1", "update": update_payload},
+                }
+            )
+        )
+
+        prompt_task = asyncio.create_task(transport.send_prompt("hello"))
+        # Wait until the request hits stdin so we can echo a matching response.
+        deadline = asyncio.get_event_loop().time() + 1.0
+        while True:
+            sent = _decode_frames(bytes(stdin.buffer))
+            matching = [f for f in sent if f["method"] == "session/prompt"]
+            if matching:
+                stdout.feed_data(
+                    _frame(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": matching[0]["id"],
+                            "result": {"stopReason": "end_turn"},
+                        }
+                    )
+                )
+                break
+            if asyncio.get_event_loop().time() > deadline:
+                raise AssertionError("never saw session/prompt request")
+            await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(prompt_task, timeout=1.0)
+        # Process is still alive — this is the production ACP behavior.
+        assert transport._proc is not None
+        assert transport._proc.returncode is None
+        assert transport._prompt_complete.is_set()
+
+        # session_updates() must drain the queued update and then exit
+        # without waiting for the process to die.
+        async def _drain() -> list[dict]:
+            return [u async for u in transport.session_updates()]
+
+        updates = await asyncio.wait_for(_drain(), timeout=1.0)
+        assert updates == [update_payload]
+    finally:
+        await transport.aclose()

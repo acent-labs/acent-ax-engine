@@ -4,17 +4,21 @@ Acceptance criteria coverage (from AXE-20):
 * terminal completed path (ACCEPTED first, COMPLETED last with stage_history)
 * terminal error path: HERMES_TIMEOUT
 * terminal error path: HERMES_CRASHED
+* terminal completed path against the production ``SubprocessHermesTransport``
+  with the subprocess kept alive after the prompt response (regression for
+  the 2026-05-10T14:04Z Codex review).
 """
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import AsyncIterator
 
 import pytest
 
 from ax_bridge.config import BridgeSettings
 from ax_bridge.contract import AXAnalysisRequest, StreamStage
-from ax_bridge.hermes_client import HermesTransport
+from ax_bridge.hermes_client import HermesTransport, SubprocessHermesTransport
 from ax_bridge.session import AnalysisSession
 
 
@@ -166,3 +170,180 @@ async def test_session_implements_hermes_transport_protocol() -> None:
     assert hasattr(transport, "send_prompt")
     assert hasattr(transport, "session_updates")
     assert hasattr(transport, "aclose")
+
+
+# --- Integration: AnalysisSession × SubprocessHermesTransport ---------------
+#
+# Reproduces the Codex 2026-05-10T14:04Z scenario: the production transport
+# returns clean responses for initialize/session/new/session/prompt and emits
+# session/update notifications, but the subprocess stays alive afterwards
+# (real ACP servers do). The stream must terminate with COMPLETED — not
+# HERMES_TIMEOUT.
+
+
+def _frame(payload: dict) -> bytes:
+    body = json.dumps(payload).encode("utf-8")
+    return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+
+
+def _decode_frames(buf: bytes) -> list[dict]:
+    frames: list[dict] = []
+    i = 0
+    while i < len(buf):
+        eol = buf.find(b"\r\n", i)
+        if eol == -1:
+            break
+        header = buf[i:eol].decode("ascii")
+        i = eol + 2
+        if buf[i : i + 2] == b"\r\n":
+            i += 2
+        else:
+            break
+        length = int(header.split(":", 1)[1].strip())
+        body = buf[i : i + length]
+        i += length
+        frames.append(json.loads(body))
+    return frames
+
+
+class _CapturingStdin:
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self.buffer.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+class _AliveFakeProc:
+    """Process stand-in that stays alive across turns (production ACP)."""
+
+    def __init__(self, stdin: _CapturingStdin, stdout: asyncio.StreamReader) -> None:
+        self.stdin = stdin
+        self.stdout = stdout
+        self.returncode: int | None = None
+
+    def terminate(self) -> None:
+        self.returncode = 0
+        self.stdout.feed_eof()
+
+    def kill(self) -> None:
+        self.terminate()
+
+    async def wait(self) -> int:
+        return self.returncode or 0
+
+
+async def _await_request(
+    stdin: _CapturingStdin, method: str, *, timeout: float = 2.0
+) -> dict:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        for frame in _decode_frames(bytes(stdin.buffer)):
+            if frame.get("method") == method:
+                return frame
+        if asyncio.get_event_loop().time() > deadline:
+            raise AssertionError(f"never saw {method} request")
+        await asyncio.sleep(0.005)
+
+
+async def _drive_acp_server(
+    stdin: _CapturingStdin,
+    stdout: asyncio.StreamReader,
+    *,
+    updates: list[dict],
+) -> None:
+    """Reply to handshake, then to session/prompt with interleaved updates."""
+
+    init = await _await_request(stdin, "initialize")
+    stdout.feed_data(
+        _frame(
+            {"jsonrpc": "2.0", "id": init["id"], "result": {"protocolVersion": 1}}
+        )
+    )
+    new_session = await _await_request(stdin, "session/new")
+    stdout.feed_data(
+        _frame(
+            {
+                "jsonrpc": "2.0",
+                "id": new_session["id"],
+                "result": {"sessionId": "sess-1"},
+            }
+        )
+    )
+    prompt = await _await_request(stdin, "session/prompt")
+    for update in updates:
+        stdout.feed_data(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {"sessionId": "sess-1", "update": update},
+                }
+            )
+        )
+    stdout.feed_data(
+        _frame(
+            {
+                "jsonrpc": "2.0",
+                "id": prompt["id"],
+                "result": {"stopReason": "end_turn"},
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_subprocess_transport_reaches_completed_with_alive_process() -> None:
+    settings = BridgeSettings(
+        ax_engine_internal_token="test-token", prompt_timeout_s=2.0
+    )
+    transport = SubprocessHermesTransport(settings)
+    stdin = _CapturingStdin()
+    stdout = asyncio.StreamReader(limit=2**20)
+    transport._proc = _AliveFakeProc(stdin, stdout)  # type: ignore[assignment]
+
+    # Override start() to skip the real subprocess spawn but keep the
+    # production handshake (initialize + session/new) running.
+    async def _fake_start() -> None:
+        transport._reader_task = asyncio.create_task(transport._read_loop())
+        await transport._handshake()
+
+    transport.start = _fake_start  # type: ignore[method-assign]
+
+    updates = [
+        {"sessionUpdate": "tool_call", "toolCallId": "1", "title": "ax-analyzer task"},
+        {"sessionUpdate": "tool_call", "toolCallId": "2", "title": "ax-drafter task"},
+        {"sessionUpdate": "tool_call", "toolCallId": "3", "title": "ax-reviewer task"},
+    ]
+    server_task = asyncio.create_task(_drive_acp_server(stdin, stdout, updates=updates))
+
+    session = AnalysisSession(_request(), transport, settings)
+
+    events = await asyncio.wait_for(_collect(session), timeout=5.0)
+    await asyncio.wait_for(server_task, timeout=1.0)
+
+    # Process must still have been alive through the entire prompt turn.
+    # (aclose() in the session finally block will mark it terminated, so we
+    # can no longer observe returncode is None here, but the stream must end
+    # with COMPLETED — not HERMES_TIMEOUT or HERMES_CRASHED.)
+    assert events[0].stage == StreamStage.ACCEPTED
+    assert events[-1].stage == StreamStage.COMPLETED, [
+        (e.stage, (e.data or {}).get("error_code")) for e in events
+    ]
+    middle_stages = [e.stage for e in events[1:-1]]
+    assert middle_stages == [
+        StreamStage.ANALYZING,
+        StreamStage.DRAFTING,
+        StreamStage.REVIEWING,
+    ]
+    completed_data = events[-1].data or {}
+    assert "latency_ms" in completed_data
+    assert completed_data["stage_history"] == [
+        StreamStage.FETCHING.value,
+        StreamStage.ANALYZING.value,
+        StreamStage.DRAFTING.value,
+        StreamStage.REVIEWING.value,
+    ]

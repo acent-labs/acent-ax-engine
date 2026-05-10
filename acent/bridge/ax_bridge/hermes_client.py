@@ -76,6 +76,11 @@ class SubprocessHermesTransport:
         self._pending: dict[int, asyncio.Future[object]] = {}
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stopped = asyncio.Event()
+        # Set when a session/prompt JSON-RPC response arrives. ACP keeps the
+        # subprocess alive across turns, so session_updates() uses this signal
+        # (queue drained AND prompt complete) to exit instead of waiting for
+        # process exit.
+        self._prompt_complete = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Public transport interface
@@ -96,13 +101,19 @@ class SubprocessHermesTransport:
     async def send_prompt(self, prompt_text: str) -> None:
         if not self._session_id:
             raise RuntimeError("ACP session not initialized")
-        await self._request(
-            "session/prompt",
-            {
-                "sessionId": self._session_id,
-                "prompt": [{"type": "text", "text": prompt_text}],
-            },
-        )
+        try:
+            await self._request(
+                "session/prompt",
+                {
+                    "sessionId": self._session_id,
+                    "prompt": [{"type": "text", "text": prompt_text}],
+                },
+            )
+        finally:
+            # Signal the update consumer that this turn produced no more
+            # session/update notifications, even though the subprocess is
+            # still running.
+            self._prompt_complete.set()
 
     async def session_updates(self) -> AsyncIterator[dict]:
         while not self._stopped.is_set():
@@ -110,6 +121,11 @@ class SubprocessHermesTransport:
                 update = await asyncio.wait_for(self._update_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 if self._proc and self._proc.returncode is not None:
+                    return
+                # Clean turn completion: the prompt response arrived and we
+                # have no more queued updates. The Hermes process stays alive
+                # for future prompts, but this turn is done.
+                if self._prompt_complete.is_set() and self._update_queue.empty():
                     return
                 continue
             yield update
