@@ -21,11 +21,21 @@ import asyncio
 import json
 import logging
 import os
-from typing import AsyncIterator, Awaitable, Callable, Optional, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, Protocol
 
 from .config import BridgeSettings
 
 logger = logging.getLogger(__name__)
+
+
+class HermesProtocolError(RuntimeError):
+    """Raised when Hermes returns a JSON-RPC ``error`` response."""
+
+    def __init__(self, code: int, message: str, data: Any = None) -> None:
+        super().__init__(f"Hermes JSON-RPC error {code}: {message}")
+        self.code = code
+        self.message = message
+        self.data = data
 
 
 class HermesTransport(Protocol):
@@ -63,6 +73,7 @@ class SubprocessHermesTransport:
         self._session_id: Optional[str] = None
         self._next_request_id: int = 0
         self._update_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._pending: dict[int, asyncio.Future[object]] = {}
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stopped = asyncio.Event()
 
@@ -151,41 +162,77 @@ class SubprocessHermesTransport:
         }
         body = json.dumps(payload).encode("utf-8")
         header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-        self._proc.stdin.write(header + body)
-        await self._proc.stdin.drain()
-        # NOTE: we do not block waiting for the matching response in this
-        # phase-1 minimal client — every response is dispatched off the read
-        # loop and surfaced through `session_updates`. The session driver
-        # treats updates as the authoritative event stream.
-        return None
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[object] = loop.create_future()
+        self._pending[request_id] = future
+        try:
+            self._proc.stdin.write(header + body)
+            await self._proc.stdin.drain()
+            return await future
+        finally:
+            self._pending.pop(request_id, None)
 
     async def _read_loop(self) -> None:
         if not self._proc or not self._proc.stdout:
             return
         stdout = self._proc.stdout
-        while not self._stopped.is_set():
-            header = await stdout.readline()
-            if not header:
+        try:
+            while not self._stopped.is_set():
+                header = await stdout.readline()
+                if not header:
+                    return
+                header_text = header.decode("ascii", errors="replace").strip()
+                if not header_text.lower().startswith("content-length:"):
+                    continue
+                try:
+                    length = int(header_text.split(":", 1)[1].strip())
+                except (IndexError, ValueError):
+                    continue
+                await stdout.readline()  # consume blank line
+                body = await stdout.readexactly(length)
+                try:
+                    message = json.loads(body)
+                except json.JSONDecodeError:
+                    logger.exception("Hermes ACP frame decode failed")
+                    continue
+                self._dispatch_message(message)
+        finally:
+            self._fail_pending(RuntimeError("Hermes ACP read loop terminated"))
+
+    def _dispatch_message(self, message: dict) -> None:
+        # JSON-RPC response: has "id" and either "result" or "error".
+        if "id" in message and ("result" in message or "error" in message):
+            request_id = message.get("id")
+            if not isinstance(request_id, int):
                 return
-            header_text = header.decode("ascii", errors="replace").strip()
-            if not header_text.lower().startswith("content-length:"):
-                continue
-            try:
-                length = int(header_text.split(":", 1)[1].strip())
-            except (IndexError, ValueError):
-                continue
-            await stdout.readline()  # consume blank line
-            body = await stdout.readexactly(length)
-            try:
-                message = json.loads(body)
-            except json.JSONDecodeError:
-                logger.exception("Hermes ACP frame decode failed")
-                continue
-            if message.get("method") == "session/update":
-                params = message.get("params") or {}
-                update = params.get("update")
-                if isinstance(update, dict):
-                    await self._update_queue.put(update)
+            future = self._pending.get(request_id)
+            if future is None or future.done():
+                return
+            if "error" in message:
+                err = message["error"] or {}
+                future.set_exception(
+                    HermesProtocolError(
+                        code=int(err.get("code", -1)),
+                        message=str(err.get("message", "unknown error")),
+                        data=err.get("data"),
+                    )
+                )
+            else:
+                future.set_result(message.get("result"))
+            return
+
+        # JSON-RPC notification: session/update is the streaming event channel.
+        if message.get("method") == "session/update":
+            params = message.get("params") or {}
+            update = params.get("update")
+            if isinstance(update, dict):
+                self._update_queue.put_nowait(update)
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        for future in list(self._pending.values()):
+            if not future.done():
+                future.set_exception(exc)
+        self._pending.clear()
 
 
 # Convenience factory used by the analyze route. Tests substitute this with a
@@ -198,6 +245,7 @@ def default_transport_factory(settings: BridgeSettings) -> HermesTransport:
 
 
 __all__ = [
+    "HermesProtocolError",
     "HermesTransport",
     "SubprocessHermesTransport",
     "TransportFactory",
