@@ -1,32 +1,74 @@
-# ACENT — FastAPI ↔ Hermes ACP Bridge (placeholder)
+# ACENT — FastAPI ↔ Hermes ACP Bridge
 
-> **Status**: placeholder. The bridge code lands with [AXE-20](https://linear.app/acent/issue/AXE-20).
+> **Phase 1, AXE-20.** Modal-first SSE entry point. Pool / backpressure /
+> writeback queue work is deferred to later phases.
 
-This directory will house the thin Python layer that bridges
-`acent-flow` FastAPI (`POST /api/ax/analyze` SSE) to Hermes via the
-Agent Client Protocol (ACP, stdio).
+This package is the thin Python layer that bridges
+`acent-flow` FastAPI (`POST /api/ax/analyze` SSE) to Hermes Agent via the
+[Agent Client Protocol (ACP)](https://github.com/zed-industries/agent-client-protocol).
 
-## Why a bridge
+## Surface
 
-- Hermes ACP is **stdio-based**, but `acent-flow` needs an **HTTP/SSE**
-  surface for the FDK browser.
-- The bridge:
-  1. Accepts the `AXAnalysisRequest` JSON from `acent-flow`
-  2. Spawns (or attaches to) a Hermes ACP process with `/skill acent-ax-analysis`
-  3. Translates Hermes' streaming output into `AXStreamEvent` SSE frames
-  4. Closes / cleans up the Hermes session on terminal stage
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `GET /healthz` | none | Liveness probe — returns `{status: ok, ...}` |
+| `POST /v1/analyze` | `Authorization: Bearer $AX_ENGINE_INTERNAL_TOKEN` | SSE analysis stream |
 
-## Open questions (resolved during AXE-20)
+`POST /v1/analyze` accepts an `AXAnalysisRequest` JSON body and emits
+`AXStreamEvent` SSE frames whose `event:` field is the `stage` value
+(`accepted` → … → `completed` | `error`).
 
-- **Per-request spawn vs persistent agent pool**: cold-start latency vs concurrency
-- **Tenant isolation**: separate Hermes process per tenant? Shared process with tagged memory?
-- **Backpressure**: what to do if a tenant pushes 100 modal clicks/min
-- **Resource limits**: max concurrent Hermes processes, memory/CPU caps
+## Architecture
+
+```
+acent-flow FastAPI
+   │  POST /v1/analyze (bearer)
+   ▼
+ax_bridge.server.analyze
+   │
+   ▼
+AnalysisSession.stream()   ← yields AXStreamEvent
+   │  ACCEPTED ─►
+   │  ACP session/update via HermesTransport
+   │   ─► StageTranslator ─► AXStreamEvent ─►
+   │  COMPLETED | ERROR ─►
+   ▼
+SubprocessHermesTransport — spawns one `hermes acp` process per request
+```
+
+## Testing
+
+```bash
+cd acent/bridge
+python3.13 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/pytest -q
+```
 
 ## Wire contract
 
-Identical to `acent-flow:app/services/ax_engine_hermes/contract.py`.
-The bridge re-uses those Pydantic models — *do not redefine them here*.
+Identical to `acent-labs/acent-flow:app/services/ax_engine_hermes/contract.py`
+(AXE-22). The file `ax_bridge/contract.py` is a verbatim vendored copy —
+**do not redefine** these models in this package; update both copies in
+lock-step when the contract version moves.
+
+## Phase 1 decisions
+
+- **Per-request spawn**: one `hermes acp` subprocess per analysis. Pool /
+  persistent agent reuse is deferred to Phase 4 (see AXE-1 EPIC).
+- **Tenant isolation**: process boundary acts as the isolation surface in
+  Phase 1. A spawned Hermes inherits a clean env, no shared session memory.
+- **Backpressure**: not handled at the bridge in Phase 1. The gateway-side
+  rate limit lives in `acent-flow`.
+- **Runtime smoke**: full `hermes acp` integration is exercised by the
+  `acent/deployment/` container, not by `acent/bridge` unit tests.
+
+## Out of scope (Phase 1)
+
+- Process pool / backpressure
+- Persistent agent sessions / multi-tenant isolation
+- Freshdesk write-back
+- Upstream Hermes source modification
 
 ## Linear
 
