@@ -119,28 +119,54 @@ Stream a `stage='reviewing'` SSE event when the reviewer task starts.
 
 ## Output contract
 
-The terminal event is `stage='completed'` carrying an `AXAnalysisResult`:
+The terminal event is `stage='completed'` carrying an `AXAnalysisResult`.
+The contract (`AXAnalysisResult`) uses `ConfigDict(extra="forbid")`, so any
+field not listed below will be **rejected** at `acent-flow`'s boundary.
 
 ```jsonc
 {
-  "run_id": "...",
-  "tenant_id": "...",
-  "external_ticket_id": "...",
-  "analysis_summary": {...},
-  "draft_output": {...},
-  "review_output": {...},
+  // required
+  "job_id": "<uuid>",                 // NOT "run_id" — must match request.job_id
+  "tenant_id": "<uuid>",
+  "status": "completed",              // JobStatus: completed | failed | cancelled | ...
+  "completed_at": "<iso8601>",        // required datetime
+
+  // analysis outputs (analysis_summary required when status == completed)
+  "analysis_summary": { ... },
+  "draft_output": { ... },
+  "review_output": { ... },
+
+  // write-back payload
   "final_private_note_html": "...",
   "final_private_note_text": "...",
-  "suggested_tags": [...],
-  "confidence_score": 0.0-1.0,
-  "recommendation": "...",
-  "usage": { "tokens_input": N, "tokens_output": N, "model_name": "..." },
-  "latency_ms": N
+  "suggested_status_change": "pending",
+  "suggested_tags": [ ... ],
+
+  // quality / routing
+  "confidence_score": 0.0,            // 0.0–1.0
+  "recommendation": "escalate",       // auto_resolve | suggest_reply | escalate | review | needs_info
+
+  // usage — FLAT fields, NOT a nested "usage" object
+  "tokens_input": 0,
+  "tokens_output": 0,
+  "model_name": "openai/gpt-5.5",
+  "latency_ms": 0,
+
+  // optional
+  "agent_feedback": null
 }
 ```
 
-On failure: `stage='error'` with `AXErrorInfo`
-(`stage`, `error_code`, `message`, `should_retry`).
+Note: `external_ticket_id` is **not** part of `AXAnalysisResult`. It lives on
+the request only — `acent-flow` re-attaches it via `job_id` lookup. Do not
+echo it into the result.
+
+On failure: emit a terminal `AXStreamEvent` with `stage="error"` whose `data`
+payload carries the `AXErrorInfo` fields (`job_id`, `stage`, `error_code`,
+`message`, optional `detail`, `should_retry`, `timestamp`). The skill MUST
+NOT emit an `AXAnalysisResult` with `analysis_summary` populated when
+`status="failed"` — the contract's `validate_status_outputs` validator
+rejects it.
 
 ## Streaming event sequence (modal-first)
 
@@ -149,8 +175,16 @@ accepted → analyzing → drafting → reviewing → completed
                                               └─ or error
 ```
 
+The contract also defines a `fetching` stage; modal-first invocations skip
+it because `ticket_data` is delivered inline by `acent-flow`. The scheduled
+prefetch path may emit `fetching` between `accepted` and `analyzing`.
+
 Emit SSE events at each stage transition, plus periodic progress events
-for stages that take >2s. Each event MUST validate against `AXStreamEvent`.
+for stages that take >2s. Each event MUST validate against `AXStreamEvent`
+— that model also uses `ConfigDict(extra="forbid")`, so any custom field
+must be tucked inside the optional `data` dict, never at the top level.
+Allowed top-level fields are exactly: `job_id`, `stage`, `timestamp`,
+`progress` (0.0–1.0), `message`, `data`.
 
 ## Hard constraints
 

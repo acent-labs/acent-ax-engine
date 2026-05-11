@@ -1,0 +1,41 @@
+{
+  "job_id": "11111111-1111-1111-1111-111111111111",
+  "tenant_id": "22222222-2222-2222-2222-222222222222",
+  "status": "completed",
+  "completed_at": "2026-05-11T15:13:14.250000+09:00",
+  "analysis_summary": {
+    "intent": "membership_activation_or_refund_inquiry",
+    "sentiment": "frustrated",
+    "urgency_score": 0.82,
+    "category": "billing",
+    "escalation_risk": true,
+    "language": "ko",
+    "key_entities": ["프로 멤버십", "결제 완료 이메일", "무료 플랜 표시", "결제번호 #PAY-77821", "결제일 2026-05-10 오후"],
+    "missing_info": ["실제 결제 성공 여부 확인", "멤버십 entitlement 동기화 상태", "환불 정책상 환불 가능 기간/조건"],
+    "run_mode": "validation-dry-run"
+  },
+  "draft_output": {
+    "private_note_html": "<p><strong>요약:</strong> 고객은 5/10 오후 프로 멤버십 결제 후 결제 완료 이메일을 받았지만 계정에는 무료 플랜으로 표시된다고 문의했습니다. 빠른 처리를 요청했고, 환불 가능 여부도 함께 질문했습니다.</p><p><strong>판단:</strong> 결제/멤버십 entitlement 동기화 지연 또는 결제 성공 후 계정 반영 실패 가능성이 높습니다. 우선 결제번호 <code>#PAY-77821</code> 기준으로 결제 상태와 계정 entitlement를 확인해야 합니다.</p><p><strong>권장 조치:</strong> billing/engineering 확인이 필요하므로 즉시 에스컬레이션하고, 고객에게 결제 확인 및 멤버십 활성화 상태를 확인 중이며 환불 가능 여부도 함께 안내하겠다고 답변하는 것이 좋습니다.</p>",
+    "private_note_text": "요약: 고객은 5/10 오후 프로 멤버십 결제 후 결제 완료 이메일을 받았지만 계정에는 무료 플랜으로 표시된다고 문의했습니다. 빠른 처리를 요청했고, 환불 가능 여부도 함께 질문했습니다.\n\n판단: 결제/멤버십 entitlement 동기화 지연 또는 결제 성공 후 계정 반영 실패 가능성이 높습니다. 우선 결제번호 #PAY-77821 기준으로 결제 상태와 계정 entitlement를 확인해야 합니다.\n\n권장 조치: billing/engineering 확인이 필요하므로 즉시 에스컬레이션하고, 고객에게 결제 확인 및 멤버십 활성화 상태를 확인 중이며 환불 가능 여부도 함께 안내하겠다고 답변하는 것이 좋습니다.",
+    "suggested_tags": ["billing", "payment", "membership", "membership_activation_failed", "refund_question", "needs_billing_review"],
+    "suggested_status": "pending",
+    "recommended_action": "escalate",
+    "confidence": 0.88
+  },
+  "review_output": {
+    "verdict": "approve",
+    "reason": "티켓 언어(한국어)를 유지했고, PII 이메일/이름은 노트에 반복하지 않았으며, 결제번호는 지원 처리에 필요한 범위라 포함했습니다. 상태/태그/조치 제안이 계약상 허용 값과 일치합니다.",
+    "issues": []
+  },
+  "final_private_note_html": "<p><strong>요약:</strong> 고객은 5/10 오후 프로 멤버십 결제 후 결제 완료 이메일을 받았지만 계정에는 무료 플랜으로 표시된다고 문의했습니다. 빠른 처리를 요청했고, 환불 가능 여부도 함께 질문했습니다.</p><p><strong>판단:</strong> 결제/멤버십 entitlement 동기화 지연 또는 결제 성공 후 계정 반영 실패 가능성이 높습니다. 우선 결제번호 <code>#PAY-77821</code> 기준으로 결제 상태와 계정 entitlement를 확인해야 합니다.</p><p><strong>권장 조치:</strong> billing/engineering 확인이 필요하므로 즉시 에스컬레이션하고, 고객에게 결제 확인 및 멤버십 활성화 상태를 확인 중이며 환불 가능 여부도 함께 안내하겠다고 답변하는 것이 좋습니다.</p>",
+  "final_private_note_text": "요약: 고객은 5/10 오후 프로 멤버십 결제 후 결제 완료 이메일을 받았지만 계정에는 무료 플랜으로 표시된다고 문의했습니다. 빠른 처리를 요청했고, 환불 가능 여부도 함께 질문했습니다.\n\n판단: 결제/멤버십 entitlement 동기화 지연 또는 결제 성공 후 계정 반영 실패 가능성이 높습니다. 우선 결제번호 #PAY-77821 기준으로 결제 상태와 계정 entitlement를 확인해야 합니다.\n\n권장 조치: billing/engineering 확인이 필요하므로 즉시 에스컬레이션하고, 고객에게 결제 확인 및 멤버십 활성화 상태를 확인 중이며 환불 가능 여부도 함께 안내하겠다고 답변하는 것이 좋습니다.",
+  "suggested_status_change": "pending",
+  "suggested_tags": ["billing", "payment", "membership", "membership_activation_failed", "refund_question", "needs_billing_review"],
+  "confidence_score": 0.88,
+  "recommendation": "escalate",
+  "tokens_input": 0,
+  "tokens_output": 0,
+  "model_name": "openai/gpt-5.5",
+  "latency_ms": 1250,
+  "agent_feedback": null
+}
