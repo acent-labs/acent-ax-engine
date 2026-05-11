@@ -1,0 +1,68 @@
+# acent-ax-engine — Fly.io app config
+#
+# Single-process deployment, mirroring local usage:
+#
+#   $ hermes dashboard          # locally — dashboard owns gateway lifecycle
+#
+# Same here: one machine runs `hermes dashboard` (port 9119) which serves the
+# SPA + /api/* and spawns `hermes gateway run` as a child. A small shell
+# wrapper kicks the gateway on boot so the OpenAI-compatible API at :8642 is
+# available without manual intervention; tini (PID 1, baked into the upstream
+# Dockerfile) reaps both children cleanly.
+#
+# Public for now — keep the API_SERVER_KEY secret as the only access guard.
+# Tighten (private network, SSO, etc.) when there's a concrete need.
+
+app             = "acent-ax-engine"
+primary_region  = "nrt"
+
+[build]
+  # Resolved relative to this fly.toml's directory.
+  dockerfile = "../../Dockerfile"
+
+[env]
+  API_SERVER_ENABLED    = "true"
+  API_SERVER_HOST       = "0.0.0.0"
+  API_SERVER_MODEL_NAME = "hermes-agent"
+  API_SERVER_PORT       = "8642"
+
+[processes]
+  app = "sh -c 'hermes gateway run > /opt/data/gateway.log 2>&1 & exec hermes dashboard --host 0.0.0.0 --port 9119 --no-open --insecure'"
+
+# Public ingress → dashboard. acent-flow can also call the gateway through
+# the same hostname on port 8642 (see [[services]] below).
+[http_service]
+  internal_port        = 9119
+  force_https          = true
+  auto_stop_machines   = false
+  auto_start_machines  = true
+  min_machines_running = 1
+  processes            = ["app"]
+
+  [[http_service.checks]]
+    interval     = "15s"
+    timeout      = "5s"
+    grace_period = "30s"
+    method       = "GET"
+    path         = "/api/status"
+    protocol     = "http"
+
+# OpenAI-compatible gateway exposed on :8642 for acent-flow.
+[[services]]
+  protocol      = "tcp"
+  internal_port = 8642
+  processes     = ["app"]
+
+  [[services.ports]]
+    port     = 8642
+    handlers = ["http"]
+
+  [[services.tcp_checks]]
+    interval     = "15s"
+    timeout      = "5s"
+    grace_period = "30s"
+
+[[vm]]
+  memory   = "1024"
+  cpu_kind = "shared"
+  cpus     = 1
