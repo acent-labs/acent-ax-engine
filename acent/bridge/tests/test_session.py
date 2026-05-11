@@ -17,7 +17,12 @@ from typing import AsyncIterator
 import pytest
 
 from ax_bridge.config import BridgeSettings
-from ax_bridge.contract import AXAnalysisRequest, StreamStage
+from ax_bridge.contract import (
+    AXAnalysisRequest,
+    AXAnalysisResult,
+    JobStatus,
+    StreamStage,
+)
 from ax_bridge.hermes_client import HermesTransport, SubprocessHermesTransport
 from ax_bridge.session import AnalysisSession
 
@@ -114,13 +119,20 @@ async def test_clean_run_emits_accepted_then_completed_with_history() -> None:
         StreamStage.REVIEWING,
     ]
     completed_data = events[-1].data or {}
-    assert "latency_ms" in completed_data
-    assert completed_data["stage_history"] == [
-        StreamStage.FETCHING.value,
-        StreamStage.ANALYZING.value,
-        StreamStage.DRAFTING.value,
-        StreamStage.REVIEWING.value,
-    ]
+    # Terminal completed.data must validate as the shared AXAnalysisResult contract.
+    result = AXAnalysisResult.model_validate(completed_data)
+    assert result.job_id == _request().job_id
+    assert result.tenant_id == _request().tenant_id
+    assert result.status == JobStatus.COMPLETED
+    assert result.latency_ms is not None and result.latency_ms >= 0
+    assert result.analysis_summary == {
+        "stage_history": [
+            StreamStage.FETCHING.value,
+            StreamStage.ANALYZING.value,
+            StreamStage.DRAFTING.value,
+            StreamStage.REVIEWING.value,
+        ]
+    }
     assert transport.started and transport.closed
 
 
@@ -161,6 +173,37 @@ async def test_stream_starts_with_accepted_and_ends_with_terminal() -> None:
 
     assert events[0].stage == StreamStage.ACCEPTED
     assert events[-1].stage in {StreamStage.COMPLETED, StreamStage.ERROR}
+
+
+@pytest.mark.asyncio
+async def test_completed_event_data_validates_as_ax_analysis_result() -> None:
+    """Regression: completed.data MUST validate as the shared AXAnalysisResult.
+
+    Codex review (2026-05-11T06:19Z) found the bridge synthesizing a terminal
+    completed event with only {latency_ms, stage_history}, which is not a
+    valid AXAnalysisResult. This test locks the contract shape independently
+    of any field-by-field assertion.
+    """
+    request = _request()
+    transport = FakeTransport(
+        updates=[
+            {"sessionUpdate": "tool_call", "toolCallId": "1", "title": "ax-analyzer"},
+            {"sessionUpdate": "tool_call", "toolCallId": "2", "title": "ax-drafter"},
+            {"sessionUpdate": "tool_call", "toolCallId": "3", "title": "ax-reviewer"},
+        ]
+    )
+    session = AnalysisSession(request, transport, _settings())
+    events = await _collect(session)
+
+    completed = events[-1]
+    assert completed.stage == StreamStage.COMPLETED
+    result = AXAnalysisResult.model_validate(completed.data)
+    assert result.job_id == request.job_id
+    assert result.tenant_id == request.tenant_id
+    assert result.status == JobStatus.COMPLETED
+    assert result.completed_at is not None
+    assert result.analysis_summary is not None
+    assert result.latency_ms is not None
 
 
 @pytest.mark.asyncio
@@ -340,10 +383,14 @@ async def test_subprocess_transport_reaches_completed_with_alive_process() -> No
         StreamStage.REVIEWING,
     ]
     completed_data = events[-1].data or {}
-    assert "latency_ms" in completed_data
-    assert completed_data["stage_history"] == [
-        StreamStage.FETCHING.value,
-        StreamStage.ANALYZING.value,
-        StreamStage.DRAFTING.value,
-        StreamStage.REVIEWING.value,
-    ]
+    result = AXAnalysisResult.model_validate(completed_data)
+    assert result.status == JobStatus.COMPLETED
+    assert result.latency_ms is not None
+    assert result.analysis_summary == {
+        "stage_history": [
+            StreamStage.FETCHING.value,
+            StreamStage.ANALYZING.value,
+            StreamStage.DRAFTING.value,
+            StreamStage.REVIEWING.value,
+        ]
+    }

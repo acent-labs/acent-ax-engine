@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi.testclient import TestClient
 
 from ax_bridge.config import BridgeSettings
+from ax_bridge.contract import AXAnalysisResult, JobStatus
 from ax_bridge.hermes_client import HermesTransport
 from ax_bridge.main import create_app
 
@@ -117,9 +118,12 @@ def test_analyze_streams_accepted_then_completed_on_clean_run() -> None:
     assert stages[0] == "accepted"
     assert stages[-1] == "completed"
 
-    # Last frame's data has latency_ms and stage_history
+    # Last frame's data must validate as the shared AXAnalysisResult contract.
     last_frame = frames[-1]
     data_line = next(line for line in last_frame.splitlines() if line.startswith("data: "))
     payload = json.loads(data_line.removeprefix("data: "))
-    assert payload["data"]["stage_history"][0] == "fetching"
-    assert "latency_ms" in payload["data"]
+    result = AXAnalysisResult.model_validate(payload["data"])
+    assert result.status == JobStatus.COMPLETED
+    assert result.latency_ms is not None
+    assert result.analysis_summary is not None
+    assert result.analysis_summary["stage_history"][0] == "fetching"

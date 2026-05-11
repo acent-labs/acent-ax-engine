@@ -8,8 +8,9 @@ turn against a freshly spawned Hermes ACP transport. The driver:
    :class:`AXAnalysisRequest`.
 3. Translates each ACP ``session/update`` into an :class:`AXStreamEvent`
    via :class:`StageTranslator` and yields it.
-4. Synthesizes a terminal ``COMPLETED`` (with ``latency_ms`` and
-   ``stage_history``) on a clean finish, or ``ERROR`` with one of the
+4. Synthesizes a terminal ``COMPLETED`` whose ``data`` validates as the
+   shared :class:`AXAnalysisResult` (``latency_ms`` plus a stage history
+   embedded in ``analysis_summary``), or ``ERROR`` with one of the
    structured error codes below on failure:
      * ``HERMES_TIMEOUT`` — overall prompt budget exceeded.
      * ``HERMES_CRASHED`` — transport raised before reaching a clean end.
@@ -23,13 +24,16 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from typing import AsyncIterator
 
 from .config import BridgeSettings
 from .contract import (
     AXAnalysisError,
     AXAnalysisRequest,
+    AXAnalysisResult,
     AXStreamEvent,
+    JobStatus,
     StreamStage,
 )
 from .hermes_client import HermesTransport
@@ -103,14 +107,21 @@ class AnalysisSession:
                 logger.exception("Hermes transport aclose failed")
 
         latency_ms = int((time.monotonic() - started_at) * 1000)
+        result = AXAnalysisResult(
+            job_id=self._request.job_id,
+            tenant_id=self._request.tenant_id,
+            status=JobStatus.COMPLETED,
+            completed_at=datetime.now(),
+            analysis_summary={
+                "stage_history": [s.value for s in self._translator.stage_history],
+            },
+            latency_ms=latency_ms,
+        )
         yield AXStreamEvent(
             job_id=self._request.job_id,
             stage=StreamStage.COMPLETED,
             message="analysis pipeline finished",
-            data={
-                "latency_ms": latency_ms,
-                "stage_history": [s.value for s in self._translator.stage_history],
-            },
+            data=result.model_dump(mode="json"),
         )
 
     async def _run_until_terminal(self) -> AsyncIterator[AXStreamEvent]:
