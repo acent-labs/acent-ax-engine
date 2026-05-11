@@ -4,14 +4,17 @@
 #
 #   $ hermes dashboard          # locally — dashboard owns gateway lifecycle
 #
-# Same here: one machine runs `hermes dashboard` (port 9119) which serves the
-# SPA + /api/* and spawns `hermes gateway run` as a child. A small shell
-# wrapper kicks the gateway on boot so the OpenAI-compatible API at :8642 is
-# available without manual intervention; tini (PID 1, baked into the upstream
-# Dockerfile) reaps both children cleanly.
+# One machine runs `hermes dashboard` (port 9119) which serves the SPA +
+# /api/* and spawns `hermes gateway run` as a child via the shell wrapper.
+# tini (PID 1, baked into the upstream Dockerfile) reaps both processes.
 #
-# Public for now — keep the API_SERVER_KEY secret as the only access guard.
-# Tighten (private network, SSO, etc.) when there's a concrete need.
+# Public for now — `API_SERVER_KEY` is the only access guard for /v1/*.
+# The dashboard itself has no auth; treat the URL as semi-secret and
+# rotate `GEMINI_API_KEY` periodically (it leaks via /api/env/reveal if
+# the URL is discovered).
+#
+# TODO: add real dashboard auth (Caddy Basic Auth sidecar or similar) —
+# tracked as a Phase 4 follow-up.
 
 app             = "acent-ax-engine"
 primary_region  = "nrt"
@@ -29,8 +32,7 @@ primary_region  = "nrt"
 [processes]
   app = "sh -c 'hermes gateway run > /opt/data/gateway.log 2>&1 & exec hermes dashboard --host 0.0.0.0 --port 9119 --no-open --insecure'"
 
-# Public ingress → dashboard. acent-flow can also call the gateway through
-# the same hostname on port 8642 (see [[services]] below).
+# Public ingress → dashboard at the root URL.
 [http_service]
   internal_port        = 9119
   force_https          = true
@@ -47,7 +49,8 @@ primary_region  = "nrt"
     path         = "/api/status"
     protocol     = "http"
 
-# OpenAI-compatible gateway exposed on :8642 for acent-flow.
+# OpenAI-compatible gateway on :8642 — acent-flow reaches it via
+# `acent-ax-engine.flycast:8642`.
 [[services]]
   protocol      = "tcp"
   internal_port = 8642
