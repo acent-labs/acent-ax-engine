@@ -21,6 +21,7 @@ can stream events directly to the gateway.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -126,30 +127,47 @@ class AnalysisSession:
 
     async def _run_until_terminal(self) -> AsyncIterator[AXStreamEvent]:
         timeout = self._settings.prompt_timeout_s
+        deadline = asyncio.get_event_loop().time() + timeout
 
-        async def driver() -> AsyncIterator[AXStreamEvent]:
-            await self._transport.start()
-            prompt = build_prompt_text(self._request, skill=self._settings.hermes_skill)
-            await self._transport.send_prompt(prompt)
-            async for update in self._transport.session_updates():
+        await self._transport.start()
+        prompt_text = build_prompt_text(self._request, skill=self._settings.hermes_skill)
+
+        # ACP servers stream `session/update` notifications while a prompt is
+        # in-flight but only send the matching `session/prompt` JSON-RPC
+        # response at end-of-turn. Awaiting send_prompt before draining
+        # session_updates would defer every stage event until after the turn
+        # finishes, defeating modal-first progressive SSE. Run send_prompt as
+        # a background task so the update iterator can yield concurrently.
+        prompt_task: asyncio.Task[None] = asyncio.create_task(
+            self._transport.send_prompt(prompt_text)
+        )
+
+        try:
+            agen = self._transport.session_updates().__aiter__()
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                try:
+                    update = await asyncio.wait_for(
+                        agen.__anext__(), timeout=remaining
+                    )
+                except StopAsyncIteration:
+                    break
                 event = self._translator.translate(update)
                 if event is not None:
                     yield event
 
-        # Wrap the inner generator with a per-step timeout that sums to the
-        # overall budget. Using a single asyncio.wait_for around the full
-        # async-generator is not possible, so we drive it manually.
-        agen = driver().__aiter__()
-        deadline = asyncio.get_event_loop().time() + timeout
-        while True:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            try:
-                event = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-            except StopAsyncIteration:
-                return
-            yield event
+            # session_updates ended cleanly; propagate any prompt-task error
+            # within the remaining budget so we still surface HERMES_TIMEOUT
+            # rather than hanging.
+            remaining = max(0.0, deadline - asyncio.get_event_loop().time())
+            await asyncio.wait_for(asyncio.shield(prompt_task), timeout=remaining)
+        finally:
+            if not prompt_task.done():
+                prompt_task.cancel()
+            with contextlib.suppress(BaseException):
+                await prompt_task
 
     def _error_event(self, code: str, message: str, *, should_retry: bool) -> AXStreamEvent:
         info = AXAnalysisError(

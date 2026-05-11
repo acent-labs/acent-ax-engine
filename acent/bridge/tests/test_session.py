@@ -206,6 +206,111 @@ async def test_completed_event_data_validates_as_ax_analysis_result() -> None:
     assert result.latency_ms is not None
 
 
+class _GatedTransport:
+    """Transport that suspends ``send_prompt`` until released.
+
+    Lets a test push ``session/update`` notifications while ``send_prompt``
+    is still in-flight, mirroring the production ACP behavior where stage
+    notifications stream during the turn but the JSON-RPC response only
+    arrives at end-of-turn.
+    """
+
+    _STOP = object()
+
+    def __init__(self) -> None:
+        self._release_prompt = asyncio.Event()
+        self._updates: asyncio.Queue[object] = asyncio.Queue()
+        self.started = False
+        self.closed = False
+        self.prompt_sent = asyncio.Event()
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def send_prompt(self, prompt_text: str) -> None:
+        self.prompt_sent.set()
+        await self._release_prompt.wait()
+
+    async def session_updates(self) -> AsyncIterator[dict]:
+        while True:
+            item = await self._updates.get()
+            if item is self._STOP:
+                return
+            assert isinstance(item, dict)
+            yield item
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    def push_update(self, update: dict) -> None:
+        self._updates.put_nowait(update)
+
+    def finish_prompt(self) -> None:
+        self._updates.put_nowait(self._STOP)
+        self._release_prompt.set()
+
+    @property
+    def prompt_released(self) -> bool:
+        return self._release_prompt.is_set()
+
+
+@pytest.mark.asyncio
+async def test_stage_events_stream_before_prompt_response() -> None:
+    """Regression (Codex 2026-05-11T06:33Z): progressive SSE.
+
+    Stage events MUST be yielded to the consumer while ``send_prompt`` is
+    still awaiting its JSON-RPC response. Pre-fix, the session driver
+    awaited ``send_prompt`` before iterating ``session_updates()``, so the
+    FDK modal saw no stage frames during the turn.
+    """
+    transport = _GatedTransport()
+    session = AnalysisSession(_request(), transport, _settings(timeout=5.0))
+    agen = session.stream().__aiter__()
+
+    accepted = await asyncio.wait_for(agen.__anext__(), timeout=1.0)
+    assert accepted.stage == StreamStage.ACCEPTED
+
+    # Schedule the next event request so `_run_until_terminal` actually
+    # runs and spawns the send_prompt task.
+    pending = asyncio.create_task(agen.__anext__())
+    await asyncio.wait_for(transport.prompt_sent.wait(), timeout=1.0)
+    assert not transport.prompt_released
+
+    transport.push_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "1", "title": "ax-analyzer task"}
+    )
+    ev_analyzing = await asyncio.wait_for(pending, timeout=1.0)
+    assert ev_analyzing.stage == StreamStage.ANALYZING
+    # The crucial invariant: prompt response has NOT arrived, but the
+    # consumer already observed the analyzing stage event.
+    assert not transport.prompt_released
+
+    transport.push_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "2", "title": "ax-drafter task"}
+    )
+    ev_drafting = await asyncio.wait_for(agen.__anext__(), timeout=1.0)
+    assert ev_drafting.stage == StreamStage.DRAFTING
+    assert not transport.prompt_released
+
+    transport.push_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "3", "title": "ax-reviewer task"}
+    )
+    ev_reviewing = await asyncio.wait_for(agen.__anext__(), timeout=1.0)
+    assert ev_reviewing.stage == StreamStage.REVIEWING
+    assert not transport.prompt_released
+
+    # Now release the prompt response — completion should follow.
+    transport.finish_prompt()
+    completed = await asyncio.wait_for(agen.__anext__(), timeout=1.0)
+    assert completed.stage == StreamStage.COMPLETED
+    AXAnalysisResult.model_validate(completed.data)
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(agen.__anext__(), timeout=1.0)
+
+    assert transport.closed
+
+
 @pytest.mark.asyncio
 async def test_session_implements_hermes_transport_protocol() -> None:
     transport: HermesTransport = FakeTransport()
@@ -394,3 +499,102 @@ async def test_subprocess_transport_reaches_completed_with_alive_process() -> No
             StreamStage.REVIEWING.value,
         ]
     }
+
+
+@pytest.mark.asyncio
+async def test_subprocess_transport_streams_updates_before_prompt_response() -> None:
+    """Progressive streaming via the real production transport.
+
+    Drives ``SubprocessHermesTransport`` step-wise: pushes one
+    ``session/update`` notification, asserts the consumer observes the
+    corresponding stage event while the ``session/prompt`` JSON-RPC
+    response is still pending, then repeats. Locks in the modal-first
+    invariant that FDK sees stage frames during the turn.
+    """
+    settings = BridgeSettings(
+        ax_engine_internal_token="test-token", prompt_timeout_s=5.0
+    )
+    transport = SubprocessHermesTransport(settings)
+    stdin = _CapturingStdin()
+    stdout = asyncio.StreamReader(limit=2**20)
+    transport._proc = _AliveFakeProc(stdin, stdout)  # type: ignore[assignment]
+
+    async def _fake_start() -> None:
+        transport._reader_task = asyncio.create_task(transport._read_loop())
+        await transport._handshake()
+
+    transport.start = _fake_start  # type: ignore[method-assign]
+
+    async def _drive_progressive_server() -> None:
+        init = await _await_request(stdin, "initialize")
+        stdout.feed_data(
+            _frame(
+                {"jsonrpc": "2.0", "id": init["id"], "result": {"protocolVersion": 1}}
+            )
+        )
+        new_session = await _await_request(stdin, "session/new")
+        stdout.feed_data(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": new_session["id"],
+                    "result": {"sessionId": "sess-1"},
+                }
+            )
+        )
+        prompt = await _await_request(stdin, "session/prompt")
+        # Drip updates one at a time so we can verify the consumer sees
+        # each one before the prompt response is released.
+        for update in (
+            {"sessionUpdate": "tool_call", "toolCallId": "1", "title": "ax-analyzer task"},
+            {"sessionUpdate": "tool_call", "toolCallId": "2", "title": "ax-drafter task"},
+            {"sessionUpdate": "tool_call", "toolCallId": "3", "title": "ax-reviewer task"},
+        ):
+            stdout.feed_data(
+                _frame(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {"sessionId": "sess-1", "update": update},
+                    }
+                )
+            )
+            # Yield so the bridge can read this frame before the next
+            # update is queued and before the prompt response is sent.
+            await asyncio.sleep(0.05)
+        stdout.feed_data(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": prompt["id"],
+                    "result": {"stopReason": "end_turn"},
+                }
+            )
+        )
+
+    server_task = asyncio.create_task(_drive_progressive_server())
+    session = AnalysisSession(_request(), transport, settings)
+    agen = session.stream().__aiter__()
+
+    accepted = await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+    assert accepted.stage == StreamStage.ACCEPTED
+
+    analyzing = await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+    assert analyzing.stage == StreamStage.ANALYZING
+    # session/prompt response NOT in stdin response stream yet — the bridge
+    # is observing updates concurrently with the in-flight prompt request.
+
+    drafting = await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+    assert drafting.stage == StreamStage.DRAFTING
+
+    reviewing = await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+    assert reviewing.stage == StreamStage.REVIEWING
+
+    completed = await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+    assert completed.stage == StreamStage.COMPLETED
+    AXAnalysisResult.model_validate(completed.data)
+
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(agen.__anext__(), timeout=2.0)
+
+    await asyncio.wait_for(server_task, timeout=1.0)
