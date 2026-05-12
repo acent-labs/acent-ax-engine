@@ -1,5 +1,11 @@
 # Hermes Agent - Development Guide
 
+> **ACENT overlay note**: this repo is a fork. ACENT customization lives under
+> `acent/` and `skills/acent/` — **do not modify upstream files**. If you are
+> working on the ACENT AX engine (not contributing to upstream Hermes), read
+> [`docs/handover.md`](docs/handover.md) and [`CLAUDE.md`](CLAUDE.md) first.
+> Sister repo (FastAPI orchestrator + FDK modal): [`acent-labs/acent-flow`](https://github.com/acent-labs/acent-flow).
+
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
 ## Development Environment
