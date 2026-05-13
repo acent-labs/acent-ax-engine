@@ -88,6 +88,13 @@ class StageTranslator:
         self.job_id = job_id
         self.current_stage: StreamStage = initial_stage
         self.stage_history: list[StreamStage] = [initial_stage]
+        # Accumulator for agent_message_chunk text. We drop the chunks
+        # from the FDK SSE stream (they would flicker the modal one
+        # character at a time) but keep the cumulative final-message
+        # text so the session driver can fold it into the terminal
+        # AXAnalysisResult payload instead of synthesizing an empty
+        # summary.
+        self._final_message_parts: list[str] = []
 
     def _advance_to(self, stage: StreamStage) -> bool:
         """Try to advance to `stage`. Returns True if state actually moved."""
@@ -138,7 +145,13 @@ class StageTranslator:
             # per-token and produces the "flickering single character"
             # UX seen in AXE-20 dogfooding. Stage progress is already
             # surfaced via tool_call kanban transitions, so token-level
-            # text is dropped at the bridge boundary.
+            # text is dropped from the SSE feed — but accumulated here
+            # so :meth:`final_message_text` can hand the full assistant
+            # answer (the analyzer/drafter/reviewer pipeline's actual
+            # output) to the session driver for the terminal payload.
+            text = _text_from_content(update.get("content"))
+            if text:
+                self._final_message_parts.append(text)
             return None
 
         if kind == "agent_thought_chunk":
@@ -156,6 +169,17 @@ class StageTranslator:
             )
 
         return None
+
+    @property
+    def final_message_text(self) -> str:
+        """Concatenated assistant text for the whole prompt turn.
+
+        Empty string if the LLM produced no ``agent_message_chunk``
+        notifications. The session driver folds this into the terminal
+        AXAnalysisResult so FDK renders the real analysis instead of a
+        synthesized placeholder.
+        """
+        return "".join(self._final_message_parts)
 
 
 __all__ = ["StageTranslator", "KANBAN_STAGE_MAP", "STAGE_ORDER"]

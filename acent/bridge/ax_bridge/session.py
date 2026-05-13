@@ -43,6 +43,52 @@ from .translate import StageTranslator
 logger = logging.getLogger(__name__)
 
 
+def _extract_structured_payload(text: str) -> object:
+    """Best-effort JSON extraction from the skill's final assistant text.
+
+    The ``acent-ax-analysis`` skill is asked to emit its result as a
+    JSON block, usually wrapped in a triple-backtick ``json`` fence.
+    The model occasionally adds chatty prose around the fence, or omits
+    the fence entirely and just emits raw JSON.
+
+    Returns the decoded object on success, or ``None`` if nothing
+    JSON-shaped can be recovered. Never raises — a malformed payload
+    just falls back to ``analysis_summary.summary`` rendering.
+    """
+    if not text:
+        return None
+    candidates: list[str] = []
+    # Prefer the last fenced ```json ... ``` block (the skill's final answer
+    # often arrives after intermediate fenced blocks).
+    lowered = text.lower()
+    end = len(text)
+    while True:
+        fence_close = text.rfind("```", 0, end)
+        if fence_close == -1:
+            break
+        # Find the matching opening fence before this close.
+        fence_open = text.rfind("```", 0, fence_close)
+        if fence_open == -1:
+            break
+        block = text[fence_open + 3 : fence_close]
+        # Strip an optional ``` "json" language tag from the first line.
+        newline = block.find("\n")
+        if newline != -1 and block[:newline].strip().lower() in ("json", ""):
+            block = block[newline + 1 :]
+        candidates.append(block.strip())
+        end = fence_open
+    # Also try the whole string, in case the model emitted raw JSON.
+    candidates.append(text.strip())
+    for candidate in candidates:
+        if not candidate or candidate[0] not in "{[":
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def build_prompt_text(request: AXAnalysisRequest, *, skill: str) -> str:
     """Render the prompt sent to Hermes.
 
@@ -108,16 +154,58 @@ class AnalysisSession:
                 logger.exception("Hermes transport aclose failed")
 
         latency_ms = int((time.monotonic() - started_at) * 1000)
-        result = AXAnalysisResult(
-            job_id=self._request.job_id,
-            tenant_id=self._request.tenant_id,
-            status=JobStatus.COMPLETED,
-            completed_at=datetime.now(),
-            analysis_summary={
-                "stage_history": [s.value for s in self._translator.stage_history],
-            },
-            latency_ms=latency_ms,
-        )
+        final_text = self._translator.final_message_text.strip()
+        analysis_summary: dict = {
+            "stage_history": [s.value for s in self._translator.stage_history],
+        }
+        structured = _extract_structured_payload(final_text)
+        if final_text:
+            # Always preserve the raw LLM answer so FDK has something
+            # to render even when the model did not emit a JSON block.
+            analysis_summary["summary"] = final_text
+        result_kwargs: dict = {
+            "job_id": self._request.job_id,
+            "tenant_id": self._request.tenant_id,
+            "status": JobStatus.COMPLETED,
+            "completed_at": datetime.now(),
+            "analysis_summary": analysis_summary,
+            "latency_ms": latency_ms,
+        }
+        if isinstance(structured, dict):
+            # Lift contract-shaped fields out of the JSON block so FDK
+            # can render dedicated sections (draft, review, tags,
+            # suggested_status_change, recommendation).
+            for key in (
+                "draft_output",
+                "review_output",
+                "final_private_note_html",
+                "final_private_note_text",
+                "suggested_status_change",
+                "suggested_tags",
+                "confidence_score",
+                "recommendation",
+            ):
+                value = structured.get(key)
+                if value is not None:
+                    result_kwargs[key] = value
+            extra_summary = structured.get("analysis_summary")
+            if isinstance(extra_summary, dict):
+                analysis_summary.update(extra_summary)
+        try:
+            result = AXAnalysisResult(**result_kwargs)
+        except Exception:
+            logger.exception(
+                "Failed to build typed AXAnalysisResult from skill output; "
+                "falling back to bare summary"
+            )
+            result = AXAnalysisResult(
+                job_id=self._request.job_id,
+                tenant_id=self._request.tenant_id,
+                status=JobStatus.COMPLETED,
+                completed_at=datetime.now(),
+                analysis_summary=analysis_summary,
+                latency_ms=latency_ms,
+            )
         yield AXStreamEvent(
             job_id=self._request.job_id,
             stage=StreamStage.COMPLETED,
