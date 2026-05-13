@@ -132,14 +132,14 @@ class StageTranslator:
             )
 
         if kind == "agent_message_chunk":
-            text = _text_from_content(update.get("content"))
-            if not text:
-                return None
-            return AXStreamEvent(
-                job_id=self.job_id,
-                stage=self.current_stage,
-                message=text,
-            )
+            # ACP streams LLM output token-by-token. Each chunk carries a
+            # tiny fragment (e.g. "결", "제", " 실패"); forwarding one
+            # AXStreamEvent per chunk forces the FDK modal to repaint
+            # per-token and produces the "flickering single character"
+            # UX seen in AXE-20 dogfooding. Stage progress is already
+            # surfaced via tool_call kanban transitions, so token-level
+            # text is dropped at the bridge boundary.
+            return None
 
         if kind == "agent_thought_chunk":
             # Internal reasoning — not surfaced to FDK.

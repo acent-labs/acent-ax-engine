@@ -37,20 +37,17 @@ def test_initial_stage_is_fetching(translator: StageTranslator) -> None:
     assert translator.stage_history == [StreamStage.FETCHING]
 
 
-def test_agent_message_chunk_emits_event_at_current_stage(translator: StageTranslator) -> None:
-    event = translator.translate(
+def test_agent_message_chunk_is_dropped_at_bridge_boundary(translator: StageTranslator) -> None:
+    # ACP streams LLM output token-by-token. Forwarding one event per token
+    # repaints the FDK modal per character ("flickering single-letter" UX
+    # seen in AXE-20 dogfooding). Stage progress is delivered via tool_call
+    # transitions instead; chunk content is dropped at the bridge boundary.
+    assert translator.translate(
         {
             "sessionUpdate": "agent_message_chunk",
             "content": {"type": "text", "text": "fetching ticket"},
         }
-    )
-    assert event is not None
-    assert event.job_id == JOB_ID
-    assert event.stage == StreamStage.FETCHING
-    assert event.message == "fetching ticket"
-
-
-def test_agent_message_chunk_with_no_text_returns_none(translator: StageTranslator) -> None:
+    ) is None
     assert translator.translate({"sessionUpdate": "agent_message_chunk"}) is None
 
 
