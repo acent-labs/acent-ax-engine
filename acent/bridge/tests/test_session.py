@@ -330,27 +330,17 @@ async def test_session_implements_hermes_transport_protocol() -> None:
 
 
 def _frame(payload: dict) -> bytes:
-    body = json.dumps(payload).encode("utf-8")
-    return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+    """Encode one NDJSON record (JSON object + trailing newline)."""
+    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 def _decode_frames(buf: bytes) -> list[dict]:
     frames: list[dict] = []
-    i = 0
-    while i < len(buf):
-        eol = buf.find(b"\r\n", i)
-        if eol == -1:
-            break
-        header = buf[i:eol].decode("ascii")
-        i = eol + 2
-        if buf[i : i + 2] == b"\r\n":
-            i += 2
-        else:
-            break
-        length = int(header.split(":", 1)[1].strip())
-        body = buf[i : i + length]
-        i += length
-        frames.append(json.loads(body))
+    for line in buf.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        frames.append(json.loads(stripped))
     return frames
 
 

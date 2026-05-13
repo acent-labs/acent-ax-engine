@@ -18,8 +18,8 @@ from ax_bridge.hermes_client import HermesProtocolError, SubprocessHermesTranspo
 
 
 def _frame(payload: dict) -> bytes:
-    body = json.dumps(payload).encode("utf-8")
-    return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+    """Encode one NDJSON record (JSON object + trailing newline)."""
+    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 class _CapturingStdin:
@@ -53,25 +53,13 @@ class _FakeProc:
 
 
 def _decode_frames(buf: bytes) -> List[dict]:
-    """Parse all Content-Length framed JSON messages out of ``buf``."""
+    """Parse all NDJSON records (one JSON object per '\\n'-terminated line) out of ``buf``."""
     frames: List[dict] = []
-    i = 0
-    while i < len(buf):
-        # Header line ending with \r\n
-        eol = buf.find(b"\r\n", i)
-        if eol == -1:
-            break
-        header = buf[i:eol].decode("ascii")
-        i = eol + 2
-        # blank line
-        if buf[i : i + 2] == b"\r\n":
-            i += 2
-        else:
-            break
-        length = int(header.split(":", 1)[1].strip())
-        body = buf[i : i + length]
-        i += length
-        frames.append(json.loads(body))
+    for line in buf.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        frames.append(json.loads(stripped))
     return frames
 
 

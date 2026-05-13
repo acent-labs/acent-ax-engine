@@ -58,13 +58,13 @@ class HermesTransport(Protocol):
 class SubprocessHermesTransport:
     """Spawn ``hermes acp`` and frame JSON-RPC over its stdio.
 
-    ACP wraps each JSON message with an LSP-style ``Content-Length`` header.
-    Hermes ships its own permission/auth/initialize handshake — those calls
-    are issued from :meth:`start` before the prompt is sent.
-
-    NOTE: this implementation is the production path. It is **not** exercised
-    by the AXE-20 unit tests because the Hermes binary is not present in CI.
-    Runtime smoke happens under ``acent/deployment/`` integration.
+    The Hermes-side ACP adapter (``acp.connection._receive_loop``) reads
+    one JSON object per line — newline-delimited JSON, not LSP
+    ``Content-Length`` framing. We therefore write
+    ``json.dumps(payload) + "\\n"`` on stdin and parse ``readline()``
+    results on stdout. Hermes ships its own permission/auth/initialize
+    handshake — those calls are issued from :meth:`start` before the
+    prompt is sent.
     """
 
     def __init__(self, settings: BridgeSettings) -> None:
@@ -153,9 +153,13 @@ class SubprocessHermesTransport:
     # ACP framing
     # ------------------------------------------------------------------
     async def _handshake(self) -> None:
+        # clientCapabilities is optional in ACP InitializeRequest and the
+        # server falls back to ClientCapabilities() defaults. We do NOT
+        # advertise filesystem or terminal capabilities — the bridge has no
+        # workspace to expose.
         await self._request(
             "initialize",
-            {"protocolVersion": 1, "clientCapabilities": {"fs": False}},
+            {"protocolVersion": 1},
         )
         new_session = await self._request(
             "session/new",
@@ -176,13 +180,15 @@ class SubprocessHermesTransport:
             "method": method,
             "params": params,
         }
-        body = json.dumps(payload).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        # NDJSON: one JSON object per line, terminated by '\n'. The
+        # serializer must not emit embedded newlines (default json.dumps
+        # without indent satisfies this).
+        body = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
         loop = asyncio.get_event_loop()
         future: asyncio.Future[object] = loop.create_future()
         self._pending[request_id] = future
         try:
-            self._proc.stdin.write(header + body)
+            self._proc.stdin.write(body)
             await self._proc.stdin.drain()
             return await future
         finally:
@@ -194,22 +200,21 @@ class SubprocessHermesTransport:
         stdout = self._proc.stdout
         try:
             while not self._stopped.is_set():
-                header = await stdout.readline()
-                if not header:
+                # NDJSON: one JSON object per '\n'-terminated line.
+                line = await stdout.readline()
+                if not line:
                     return
-                header_text = header.decode("ascii", errors="replace").strip()
-                if not header_text.lower().startswith("content-length:"):
+                stripped = line.strip()
+                if not stripped:
                     continue
                 try:
-                    length = int(header_text.split(":", 1)[1].strip())
-                except (IndexError, ValueError):
-                    continue
-                await stdout.readline()  # consume blank line
-                body = await stdout.readexactly(length)
-                try:
-                    message = json.loads(body)
+                    message = json.loads(stripped)
                 except json.JSONDecodeError:
-                    logger.exception("Hermes ACP frame decode failed")
+                    logger.exception(
+                        "Hermes ACP frame decode failed: %r", stripped[:200]
+                    )
+                    continue
+                if not isinstance(message, dict):
                     continue
                 self._dispatch_message(message)
         finally:
