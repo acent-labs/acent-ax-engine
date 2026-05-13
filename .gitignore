@@ -72,3 +72,6 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+
+# Codex session metadata (per-checkout, not source of truth)
+.context/
